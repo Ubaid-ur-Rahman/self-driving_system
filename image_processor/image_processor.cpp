@@ -1,19 +1,3 @@
-/* Copyright 2021 iwatake2222
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
-/*** Include ***/
-/* for general */
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
@@ -25,6 +9,7 @@ limitations under the License.
 #include <chrono>
 #include <fstream>
 #include <memory>
+#include <filesystem> // Added for directory creation
 
 /* for OpenCV */
 #include <opencv2/opencv.hpp>
@@ -42,7 +27,6 @@ limitations under the License.
 #include "image_processor_if.h"
 #include "image_processor.h"
 
-
 /*** Macro ***/
 #define TAG "ImageProcessor"
 #define PRINT(...)   COMMON_HELPER_PRINT(TAG, __VA_ARGS__)
@@ -50,7 +34,9 @@ limitations under the License.
 
 #define COLOR_BG  CommonHelper::CreateCvColor(70, 70, 70)
 static constexpr float kTopViewSizeRatio = 1.0f;
-
+static constexpr int32_t kMaxFrames = 1000; // Safeguard against infinite loops
+static constexpr int32_t kModelInputWidth = 192;
+static constexpr int32_t kModelInputHeight = 320;
 
 /*** Global variable ***/
 
@@ -63,55 +49,48 @@ ImageProcessor::ImageProcessor()
 
 ImageProcessor::~ImageProcessor()
 {
+    mat_transform_.release();
 }
 
 int32_t ImageProcessor::Initialize(const ImageProcessorIf::InputParam& input_param)
 {
+
     if (object_detection_.Initialize(input_param.work_dir, input_param.num_threads) != ObjectDetection::kRetOk) {
         object_detection_.Finalize();
         return kRetErr;
     }
-
     if (lane_detection_.Initialize(input_param.work_dir, input_param.num_threads) != LaneDetection::kRetOk) {
         lane_detection_.Finalize();
+        object_detection_.Finalize();
         return kRetErr;
     }
-
     if (segmentation_engine_.Initialize(input_param.work_dir, input_param.num_threads) != SemanticSegmentationEngine::kRetOk) {
         segmentation_engine_.Finalize();
+        lane_detection_.Finalize();
+        object_detection_.Finalize();
         return kRetErr;
     }
-
     if (depth_engine_.Initialize(input_param.work_dir, input_param.num_threads) != DepthEngine::kRetOk) {
         depth_engine_.Finalize();
+        segmentation_engine_.Finalize();
+        lane_detection_.Finalize();
+        object_detection_.Finalize();
         return kRetErr;
     }
-
     frame_cnt_ = 0;
     vanishment_y_ = 1280 / 2;
-
     return kRetOk;
 }
 
 int32_t ImageProcessor::Finalize(void)
 {
-    if (object_detection_.Finalize() != ObjectDetection::kRetOk) {
-        return kRetErr;
-    }
-
-    if (lane_detection_.Finalize() != LaneDetection::kRetOk) {
-        return kRetErr;
-    }
-
-    if (segmentation_engine_.Finalize() != SemanticSegmentationEngine::kRetOk) {
-        return kRetErr;
-    }
-
-    if (depth_engine_.Finalize() != DepthEngine::kRetOk) {
-        return kRetErr;
-    }
-
-    return kRetOk;
+    mat_transform_.release();
+    int32_t ret = kRetOk;
+    if (object_detection_.Finalize() != ObjectDetection::kRetOk) ret = kRetErr;
+    if (lane_detection_.Finalize() != LaneDetection::kRetOk) ret = kRetErr;
+    if (segmentation_engine_.Finalize() != SemanticSegmentationEngine::kRetOk) ret = kRetErr;
+    if (depth_engine_.Finalize() != DepthEngine::kRetOk) ret = kRetErr;
+    return ret;
 }
 
 int32_t ImageProcessor::Command(int32_t cmd)
@@ -125,111 +104,203 @@ int32_t ImageProcessor::Command(int32_t cmd)
     return kRetOk;
 }
 
+void ImageProcessor::SaveBoundingBoxes(const std::vector<BoundingBox>& bbox_list, const std::string& filename)
+{
+    PRINT("Saving %zu bounding boxes to %s\n", bbox_list.size(), filename.c_str());
+    std::ofstream ofs(filename, std::ios::app);
+    if (!ofs.is_open()) {
+        PRINT_E("Failed to open %s for writing\n", filename.c_str());
+        return;
+    }
+    for (const auto& bbox : bbox_list) {
+        ofs << bbox.class_id << "," << bbox.label << "," << bbox.score << ","
+            << bbox.x << "," << bbox.y << "," << bbox.w << "," << bbox.h << "\n";
+    }
+}
+
 int32_t ImageProcessor::Process(const cv::Mat& mat_original, ImageProcessorIf::Result& result)
 {
-    /*** Initialize internal parameters using input image information ***/
+    if (frame_cnt_ >= kMaxFrames) {
+        PRINT_E("Max frame limit (%d) reached, stopping processing\n", kMaxFrames);
+        return kRetErr;
+    }
+
+    if (mat_original.empty()) {
+        PRINT_E("Input image is empty\n");
+        return kRetErr;
+    }
+
+    // Resize input to match model dimensions
+    cv::Mat mat_resized;
+    cv::resize(mat_original, mat_resized, cv::Size(kModelInputWidth, kModelInputHeight), 0, 0, cv::INTER_AREA);
+    PRINT("[DEBUG] Frame %d: Resized input to %dx%d, type=%d\n", frame_cnt_, mat_resized.cols, mat_resized.rows, mat_resized.type());
+
+    // Reset camera with resized dimensions
     if (frame_cnt_ == 0) {
-        ResetCamera(mat_original.cols, mat_original.rows);
+        ResetCamera(mat_resized.cols, mat_resized.rows); // Use actual resized dimensions
     }
 
-    /*** Run inference ***/
-    if (object_detection_.Process(mat_original, mat_transform_, camera_real_) != ObjectDetection::kRetOk) {
+    // Run inference on resized image
+    if (object_detection_.Process(mat_resized, mat_transform_, camera_real_) != ObjectDetection::kRetOk) {
+        PRINT_E("Object detection failed\n");
         return kRetErr;
     }
-
-    if (lane_detection_.Process(mat_original, mat_transform_, camera_real_) != LaneDetection::kRetOk) {
+    if (lane_detection_.Process(mat_resized, mat_transform_, camera_real_) != LaneDetection::kRetOk) {
+        PRINT_E("Lane detection failed\n");
         return kRetErr;
     }
-
     SemanticSegmentationEngine::Result segmentation_result;
-    if (segmentation_engine_.Process(mat_original, segmentation_result) != SemanticSegmentationEngine::kRetOk) {
+    if (segmentation_engine_.Process(mat_resized, segmentation_result) != SemanticSegmentationEngine::kRetOk) {
+        PRINT_E("Segmentation failed\n");
+        return kRetErr;
+    }
+    DepthEngine::Result depth_result;
+    if (depth_engine_.Process(mat_resized, depth_result) != DepthEngine::kRetOk) {
+        PRINT_E("Depth estimation failed\n");
         return kRetErr;
     }
 
-    DepthEngine::Result depth_result;
-    if (depth_engine_.Process(mat_original, depth_result) != DepthEngine::kRetOk) {
-        return -1;
-    }
+    // Save results to disk
+    std::string frame_id_str = std::to_string(frame_cnt_);
+    CommonHelper::SaveImage(mat_original, "output/frame_" + frame_id_str + ".jpg"); // Save original for reference
 
-    /*** Create Mat for output ***/
-    cv::Mat mat = mat_original.clone();
-    cv::Mat mat_topview;
-    cv::Mat mat_depth;
-    cv::Mat mat_segmentation;
-    //CreateTopViewMat(mat_original, mat_topview);
+    // Save object detection results
+    const auto& bboxes = object_detection_.GetBoundingBoxes();
+    SaveBoundingBoxes(bboxes, "output/bboxes_" + frame_id_str + ".csv");
 
-    /*** Draw result ***/
-    const auto& time_draw0 = std::chrono::steady_clock::now();
-    if (!segmentation_result.image_combined.empty() || !segmentation_result.image_list.empty()) {
-        DrawSegmentation(mat_segmentation, segmentation_result);
-        cv::resize(mat_segmentation, mat_segmentation, mat.size());
-        //cv::add(mat_segmentation, mat, mat);
-        CreateTopViewMat(mat_segmentation, mat_topview);
-        mat_segmentation = mat_segmentation(cv::Rect(0, vanishment_y_, mat_segmentation.cols, mat_segmentation.rows - vanishment_y_));
+    // Save lane detection results
+    const auto& lane_points_list = lane_detection_.GetLanePoints();
+    std::ofstream lane_file("output/lanes_" + frame_id_str + ".csv");
+    if (!lane_file.is_open()) {
+        PRINT_E("Failed to open lanes_%s.csv for writing\n", frame_id_str.c_str());
     } else {
-        mat_topview = cv::Mat::zeros(mat.size(), CV_8UC3);
+        for (size_t lane_idx = 0; lane_idx < lane_points_list.size(); ++lane_idx) {
+            for (const auto& pt : lane_points_list[lane_idx]) {
+                lane_file << lane_idx << "," << pt.x << "," << pt.y << "\n";
+            }
+        }
     }
-    cv::line(mat, cv::Point(0, camera_real_.EstimateVanishmentY()), cv::Point(mat.cols, camera_real_.EstimateVanishmentY()), cv::Scalar(0, 0, 0), 1);
-    lane_detection_.Draw(mat, mat_topview, camera_top_);
-    object_detection_.Draw(mat, mat_topview);
 
+    // Save segmentation and depth results
+    cv::Mat mat_segmentation;
+    if (!segmentation_result.image_combined.empty()) {
+        // Resize segmentation output to match model input size
+        cv::resize(segmentation_result.image_combined, mat_segmentation, cv::Size(kModelInputWidth, kModelInputHeight), 0, 0, cv::INTER_NEAREST);
+        PRINT("[DEBUG] Frame %d: mat_segmentation resized from image_combined size=%dx%d, type=%d\n", frame_cnt_, mat_segmentation.cols, mat_segmentation.rows, mat_segmentation.type());
+    } else if (!segmentation_result.image_list.empty()) {
+        DrawSegmentation(mat_segmentation, segmentation_result);
+        PRINT("[DEBUG] Frame %d: mat_segmentation from DrawSegmentation size=%dx%d, type=%d\n", frame_cnt_, mat_segmentation.cols, mat_segmentation.rows, mat_segmentation.type());
+    } else {
+        PRINT_E("Segmentation result is empty\n");
+        mat_segmentation = cv::Mat::zeros(cv::Size(kModelInputWidth, kModelInputHeight), CV_8UC3);
+    }
+    if (!mat_segmentation.empty()) {
+        CommonHelper::SaveImage(mat_segmentation, "output/seg_" + frame_id_str + ".png");
+        result.mat_output_segmentation = mat_segmentation.clone(); // Assign for main.cpp
+    }
+
+    // --- Depth output ---
+    cv::Mat mat_depth;
     if (!depth_result.mat_out.empty()) {
         DrawDepth(mat_depth, depth_result);
+        PRINT("[DEBUG] Frame %d: mat_depth size=%dx%d, type=%d\n", frame_cnt_, mat_depth.cols, mat_depth.rows, mat_depth.type());
+        CommonHelper::SaveImage(mat_depth, "output/depth_" + frame_id_str + ".png");
+        result.mat_output_depth = mat_depth.clone(); // Assign
+    } else {
+        PRINT_E("Depth result is empty\n");
+        mat_depth = cv::Mat::zeros(cv::Size(kModelInputWidth, kModelInputHeight), CV_8UC3);
     }
-    const auto& time_draw1 = std::chrono::steady_clock::now();
 
-    /*** Draw statistics ***/
-    double time_draw = (time_draw1 - time_draw0).count() / 1000000.0;
-    double time_inference = object_detection_.GetTimeInference() + lane_detection_.GetTimeInference() + segmentation_result.time_inference + depth_result.time_inference;
-    DrawFps(mat, time_inference, time_draw, cv::Point(0, 0), 0.5, 2, CommonHelper::CreateCvColor(0, 0, 0), CommonHelper::CreateCvColor(180, 180, 180), true);
+    // --- Topview output ---
+    cv::Mat mat_topview;
+    if (!mat_segmentation.empty()) {
+        // Use the resized segmentation visual for topview creation
+        CreateTopViewMat(mat_segmentation, mat_topview);
+        PRINT("[DEBUG] Frame %d: mat_topview after CreateTopViewMat size=%dx%d, type=%d\n", frame_cnt_, mat_topview.cols, mat_topview.rows, mat_topview.type());
+    } else {
+        // Fallback empty topview
+        mat_topview = cv::Mat::zeros(cv::Size(kModelInputWidth, kModelInputHeight), CV_8UC3);
+        PRINT("[DEBUG] Frame %d: mat_topview fallback size=%dx%d, type=%d\n", frame_cnt_, mat_topview.cols, mat_topview.rows, mat_topview.type());
+    }
+    if (!mat_topview.empty()) {
+        CommonHelper::SaveImage(mat_topview, "output/topview_" + frame_id_str + ".png");
+        result.mat_output_topview = mat_topview.clone();
+    }
 
-    /*** Update internal status ***/
+    // For simplicity, let result.mat_output be the original image resized
+    result.mat_output = mat_resized.clone(); // or build a richer overlay if desired
+
+    // Update internal status
     frame_cnt_++;
 
-    /*** Return the results ***/
-    result.mat_output = mat;
-    result.mat_output_segmentation = mat_segmentation;
-    result.mat_output_depth = mat_depth;
-    result.mat_output_topview = mat_topview;
+    // Return results
     result.time_pre_process = object_detection_.GetTimePreProcess() + lane_detection_.GetTimePreProcess() + segmentation_result.time_pre_process + depth_result.time_pre_process;
     result.time_inference = object_detection_.GetTimeInference() + lane_detection_.GetTimeInference() + segmentation_result.time_inference + depth_result.time_inference;
     result.time_post_process = object_detection_.GetTimePostProcess() + lane_detection_.GetTimePostProcess() + segmentation_result.time_post_process + depth_result.time_post_process;
 
+    // Release engine results
+    for (auto& img : segmentation_result.image_list) {
+        img.release();
+    }
+    segmentation_result.image_combined.release();
+    depth_result.mat_out.release();
+    mat_resized.release();
+    mat_segmentation.release();
+    mat_depth.release();
+    mat_topview.release();
+
+    PRINT("[DEBUG] Frame %d: Returning result mats: output=(%d,%d) topview=(%d,%d) depth=(%d,%d) segmentation=(%d,%d)\n",
+          frame_cnt_, result.mat_output.cols, result.mat_output.rows,
+          result.mat_output_topview.cols, result.mat_output_topview.rows,
+          result.mat_output_depth.cols, result.mat_output_depth.rows,
+          result.mat_output_segmentation.cols, result.mat_output_segmentation.rows);
+    PRINT("[DEBUG] Frame %d: Processing complete for frame %d\n", frame_cnt_, frame_cnt_);
+
     return kRetOk;
 }
-
 
 void ImageProcessor::DrawDepth(cv::Mat& mat, const DepthEngine::Result& depth_result)
 {
     if (!depth_result.mat_out.empty()) {
         cv::applyColorMap(depth_result.mat_out, mat, cv::COLORMAP_PLASMA);
+        PRINT("[DEBUG] Frame %d: DrawDepth applied, mat size=%dx%d, type=%d\n", frame_cnt_, mat.cols, mat.rows, mat.type());
+    } else {
+        PRINT("[DEBUG] Frame %d: DrawDepth skipped, depth_result.mat_out is empty\n", frame_cnt_);
+        mat = cv::Mat::zeros(cv::Size(kModelInputWidth, kModelInputHeight), CV_8UC3);
     }
 }
 
 void ImageProcessor::DrawSegmentation(cv::Mat& mat_segmentation, const SemanticSegmentationEngine::Result& segmentation_result)
 {
-    /* Draw on NormalView */
     if (!segmentation_result.image_combined.empty()) {
-        mat_segmentation = segmentation_result.image_combined;
-    } else {
+        cv::resize(segmentation_result.image_combined, mat_segmentation, cv::Size(kModelInputWidth, kModelInputHeight), 0, 0, cv::INTER_NEAREST);
+        PRINT("[DEBUG] Frame %d: DrawSegmentation from image_combined size=%dx%d, type=%d\n", frame_cnt_, mat_segmentation.cols, mat_segmentation.rows, mat_segmentation.type());
+    } else if (!segmentation_result.image_list.empty()) {
         std::vector<cv::Mat> mat_segmentation_list(4, cv::Mat());
 #pragma omp parallel for
         for (int32_t i = 0; i < static_cast<int32_t>(segmentation_result.image_list.size()); i++) {
             cv::Mat mat_fp32_3;
-            cv::cvtColor(segmentation_result.image_list[i], mat_fp32_3, cv::COLOR_GRAY2BGR); /* 1channel -> 3 channel */
+            cv::cvtColor(segmentation_result.image_list[i], mat_fp32_3, cv::COLOR_GRAY2BGR);
             cv::multiply(mat_fp32_3, GetColorForSegmentation(i), mat_fp32_3);
             mat_fp32_3.convertTo(mat_fp32_3, CV_8UC3, 1, 0);
-            mat_segmentation_list[i] = mat_fp32_3;
+            cv::resize(mat_fp32_3, mat_segmentation_list[i], cv::Size(kModelInputWidth, kModelInputHeight), 0, 0, cv::INTER_NEAREST);
         }
 
-        //#pragma omp parallel for  /* don't use */
-        mat_segmentation = cv::Mat::zeros(mat_segmentation_list[0].size(), CV_8UC3);
+        mat_segmentation = cv::Mat::zeros(cv::Size(kModelInputWidth, kModelInputHeight), CV_8UC3);
+        PRINT("[DEBUG] Frame %d: DrawSegmentation initialized zero mat size=%dx%d, type=%d\n", frame_cnt_, mat_segmentation.cols, mat_segmentation.rows, mat_segmentation.type());
         for (int32_t i = 0; i < static_cast<int32_t>(mat_segmentation_list.size()); i++) {
-            cv::add(mat_segmentation, mat_segmentation_list[i], mat_segmentation);
+            if (!mat_segmentation_list[i].empty()) {
+                cv::add(mat_segmentation, mat_segmentation_list[i], mat_segmentation);
+            }
         }
+        for (auto& mat : mat_segmentation_list) {
+            mat.release();
+        }
+        PRINT("[DEBUG] Frame %d: DrawSegmentation after add size=%dx%d, type=%d\n", frame_cnt_, mat_segmentation.cols, mat_segmentation.rows, mat_segmentation.type());
+    } else {
+        mat_segmentation = cv::Mat::zeros(cv::Size(kModelInputWidth, kModelInputHeight), CV_8UC3);
     }
 }
-
 
 void ImageProcessor::DrawFps(cv::Mat& mat, double time_inference, double time_draw, cv::Point pos, double font_scale, int32_t thickness, cv::Scalar color_front, cv::Scalar color_back, bool is_text_on_rect)
 {
@@ -241,7 +312,6 @@ void ImageProcessor::DrawFps(cv::Mat& mat, double time_inference, double time_dr
     snprintf(text, sizeof(text), "FPS: %.1f, Inference: %.1f [ms], Draw: %.1f [ms]", fps, time_inference, time_draw);
     CommonHelper::DrawText(mat, text, cv::Point(0, 0), 0.5, 2, CommonHelper::CreateCvColor(0, 0, 0), CommonHelper::CreateCvColor(180, 180, 180), true);
 }
-
 
 cv::Scalar ImageProcessor::GetColorForSegmentation(int32_t id)
 {
@@ -265,13 +335,15 @@ void ImageProcessor::ResetCamera(int32_t width, int32_t height, float fov_deg)
         camera_top_.SetIntrinsic(static_cast<int32_t>(width * kTopViewSizeRatio), static_cast<int32_t>(height * kTopViewSizeRatio), FocalLength(static_cast<int32_t>(width * kTopViewSizeRatio), fov_deg));
     }
     camera_real_.SetExtrinsic(
-        { 0.0f, 0.0f, 0.0f },    /* rvec [deg] */
-        { 0.0f, -1.5f, 0.0f }, true);   /* tvec (Oc - Ow in world coordinate. X+= Right, Y+ = down, Z+ = far) */
+        { 0.0f, 0.0f, 0.0f },
+        { 0.0f, -1.5f, 0.0f }, true);
     camera_top_.SetExtrinsic(
-        { 90.0f, 0.0f, 0.0f },    /* rvec [deg] */
-        { 0.0f, -8.0f, 11.0f }, true);   /* tvec (Oc - Ow in world coordinate. X+= Right, Y+ = down, Z+ = far) */
+        { 90.0f, 0.0f, 0.0f },
+        { 0.0f, -8.0f, 11.0f }, true);
     CreateTransformMat();
     vanishment_y_ = std::max(0, std::min(height, camera_real_.EstimateVanishmentY()));
+    PRINT("[DEBUG] Frame %d: ResetCamera with width=%d, height=%d, camera_real=%dx%d, camera_top=%dx%d\n",
+          frame_cnt_, width, height, camera_real_.width, camera_real_.height, camera_top_.width, camera_top_.height);
 }
 
 void ImageProcessor::GetCameraParameter(float& focal_length, std::array<float, 3>& real_rvec, std::array<float, 3>& real_tvec, std::array<float, 3>& top_rvec, std::array<float, 3>& top_tvec)
@@ -291,36 +363,88 @@ void ImageProcessor::SetCameraParameter(float focal_length, const std::array<flo
     camera_top_.SetExtrinsic(top_rvec, top_tvec);
     CreateTransformMat();
     vanishment_y_ = std::max(0, std::min(camera_real_.height, camera_real_.EstimateVanishmentY()));
+    PRINT("[DEBUG] Frame %d: SetCameraParameter with focal_length=%.1f, camera_real=%dx%d, camera_top=%dx%d\n",
+          frame_cnt_, focal_length, camera_real_.width, camera_real_.height, camera_top_.width, camera_top_.height);
 }
 
 void ImageProcessor::CreateTransformMat()
 {
-    /*** Generate mapping b/w object points (3D: world coordinate) and image points (real camera) */
-    std::vector<cv::Point3f> object_point_list = {   /* Target area (possible road area) */
+    std::vector<cv::Point3f> object_point_list = {
         { -1.0f, 0, 10.0f },
-        {  1.0f, 0, 10.0f },
-        { -1.0f, 0,  3.0f },
-        {  1.0f, 0,  3.0f },
+        { 1.0f, 0, 10.0f },
+        { -1.0f, 0, 3.0f },
+        { 1.0f, 0, 3.0f },
     };
     std::vector<cv::Point2f> image_point_real_list;
     cv::projectPoints(object_point_list, camera_real_.rvec, camera_real_.tvec, camera_real_.K, camera_real_.dist_coeff, image_point_real_list);
 
-    /* Convert to image points (2D) using the top view camera (virtual camera) */
     std::vector<cv::Point2f> image_point_top_list;
     cv::projectPoints(object_point_list, camera_top_.rvec, camera_top_.tvec, camera_top_.K, camera_top_.dist_coeff, image_point_top_list);
 
     mat_transform_ = cv::getPerspectiveTransform(&image_point_real_list[0], &image_point_top_list[0]);
+    PRINT("[DEBUG] Frame %d: CreateTransformMat, mat_transform_ size=%dx%d\n", frame_cnt_, mat_transform_.cols, mat_transform_.rows);
 }
 
 void ImageProcessor::CreateTopViewMat(const cv::Mat& mat_original, cv::Mat& mat_topview)
 {
-    /* Perspective Transform */   
-    mat_topview = cv::Mat(cv::Size(camera_top_.width, camera_top_.height), CV_8UC3, COLOR_BG);
-    //cv::warpPerspective(mat_original, mat_topview, mat_transform_, mat_topview.size(), cv::INTER_LINEAR, cv::BORDER_TRANSPARENT);
-    cv::warpPerspective(mat_original, mat_topview, mat_transform_, mat_topview.size(), cv::INTER_NEAREST);
+    if (mat_original.empty() || mat_transform_.empty()) {
+        PRINT_E("Invalid input or transform matrix for top view\n");
+        mat_topview = cv::Mat::zeros(cv::Size(kModelInputWidth, kModelInputHeight), CV_8UC3);
+        PRINT("[DEBUG] Frame %d: CreateTopViewMat fallback size=%dx%d, type=%d\n", frame_cnt_, mat_topview.cols, mat_topview.rows, mat_topview.type());
+        return;
+    }
 
-#if 1
-    /* Display Grid lines */
+    // Ensure input dimensions match expected
+    cv::Mat mat_input = mat_original;
+    if (mat_input.cols != kModelInputWidth || mat_input.rows != kModelInputHeight) {
+        cv::resize(mat_input, mat_input, cv::Size(kModelInputWidth, kModelInputHeight), 0, 0, cv::INTER_NEAREST);
+        PRINT("[DEBUG] Frame %d: Resized mat_input to %dx%d for top view\n", frame_cnt_, mat_input.cols, mat_input.rows);
+    }
+
+    // Determine the bounding box of the transformed points
+    std::vector<cv::Point2f> corners(4);
+    corners[0] = cv::Point2f(0, 0);
+    corners[1] = cv::Point2f(mat_input.cols - 1, 0);
+    corners[2] = cv::Point2f(0, mat_input.rows - 1);
+    corners[3] = cv::Point2f(mat_input.cols - 1, mat_input.rows - 1);
+    std::vector<cv::Point2f> transformed_corners(4);
+    cv::perspectiveTransform(corners, transformed_corners, mat_transform_);
+
+    // Find the bounding box of the transformed corners
+    float min_x = std::min({transformed_corners[0].x, transformed_corners[1].x, transformed_corners[2].x, transformed_corners[3].x});
+    float max_x = std::max({transformed_corners[0].x, transformed_corners[1].x, transformed_corners[2].x, transformed_corners[3].x});
+    float min_y = std::min({transformed_corners[0].y, transformed_corners[1].y, transformed_corners[2].y, transformed_corners[3].y});
+    float max_y = std::max({transformed_corners[0].y, transformed_corners[1].y, transformed_corners[2].y, transformed_corners[3].y});
+
+    // Ensure valid bounds
+    min_x = std::max(min_x, 0.0f);
+    min_y = std::max(min_y, 0.0f);
+    int topview_width = static_cast<int>(max_x - min_x + 10);
+    int topview_height = static_cast<int>(max_y - min_y + 10);
+    topview_width = std::max(topview_width, kModelInputWidth);
+    topview_height = std::max(topview_height, kModelInputHeight);
+
+    // Validate dimensions
+    if (topview_width <= 0 || topview_height <= 0) {
+        PRINT_E("Invalid topview dimensions: width=%d, height=%d\n", topview_width, topview_height);
+        mat_topview = cv::Mat::zeros(cv::Size(kModelInputWidth, kModelInputHeight), CV_8UC3);
+        return;
+    }
+
+    mat_topview = cv::Mat(cv::Size(topview_width, topview_height), CV_8UC3, COLOR_BG);
+    PRINT("[DEBUG] Frame %d: CreateTopViewMat initialized mat_topview size=%dx%d, type=%d\n", frame_cnt_, mat_topview.cols, mat_topview.rows, mat_topview.type());
+
+    // Adjust the transformation to map to the new origin
+    cv::Mat translation = (cv::Mat_<float>(3, 3) << 1, 0, -min_x,
+                                                 0, 1, -min_y,
+                                                 0, 0, 1);
+    cv::Mat adjusted_transform = translation * mat_transform_;
+
+    // Perform the warp with the adjusted transform
+    cv::warpPerspective(mat_input, mat_topview, adjusted_transform, mat_topview.size(), cv::INTER_NEAREST | cv::WARP_INVERSE_MAP);
+    PRINT("[DEBUG] Frame %d: CreateTopViewMat after warpPerspective size=%dx%d, type=%d\n", frame_cnt_, mat_topview.cols, mat_topview.rows, mat_topview.type());
+
+    // Draw depth lines
     static constexpr int32_t kDepthInterval = 5;
     static constexpr int32_t kHorizontalRange = 10;
     std::vector<cv::Point3f> object_point_list;
@@ -332,10 +456,19 @@ void ImageProcessor::CreateTopViewMat(const cv::Mat& mat_original, cv::Mat& mat_
     cv::projectPoints(object_point_list, camera_top_.rvec, camera_top_.tvec, camera_top_.K, camera_top_.dist_coeff, image_point_list);
     for (int32_t i = 0; i < static_cast<int32_t>(image_point_list.size()); i++) {
         if (i % 2 != 0) {
-            cv::line(mat_topview, image_point_list[i - 1], image_point_list[i], cv::Scalar(255, 255, 255));
+            cv::Point2f p1 = image_point_list[i - 1];
+            cv::Point2f p2 = image_point_list[i];
+            // Clip points to mat_topview bounds
+            p1.x = std::max(0.0f, std::min(p1.x, static_cast<float>(mat_topview.cols - 1)));
+            p1.y = std::max(0.0f, std::min(p1.y, static_cast<float>(mat_topview.rows - 1)));
+            p2.x = std::max(0.0f, std::min(p2.x, static_cast<float>(mat_topview.cols - 1)));
+            p2.y = std::max(0.0f, std::min(p2.y, static_cast<float>(mat_topview.rows - 1)));
+            cv::line(mat_topview, p1, p2, cv::Scalar(255, 255, 255));
         } else {
-            CommonHelper::DrawText(mat_topview, std::to_string(i / 2 * kDepthInterval) + "[m]", image_point_list[i], 0.5, 2, CommonHelper::CreateCvColor(0, 0, 0), CommonHelper::CreateCvColor(255, 255, 255), false);
+            cv::Point2f p = image_point_list[i];
+            p.x = std::max(0.0f, std::min(p.x, static_cast<float>(mat_topview.cols - 1)));
+            p.y = std::max(0.0f, std::min(p.y, static_cast<float>(mat_topview.rows - 1)));
+            CommonHelper::DrawText(mat_topview, std::to_string(i / 2 * kDepthInterval) + "[m]", p, 0.5, 2, CommonHelper::CreateCvColor(0, 0, 0), CommonHelper::CreateCvColor(255, 255, 255), false);
         }
     }
-#endif
 }

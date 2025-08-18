@@ -27,9 +27,13 @@ limitations under the License.
 /* for OpenCV */
 #include <opencv2/opencv.hpp>
 
-#include "common_helper.h"
+/* for My modules */
 #include "common_helper_cv.h"
 
+/*** Macro ***/
+#define TAG "CommonHelperCv"
+#define PRINT(...)   COMMON_HELPER_PRINT(TAG, __VA_ARGS__)
+#define PRINT_E(...) COMMON_HELPER_PRINT_E(TAG, __VA_ARGS__)
 
 cv::Scalar CommonHelper::CreateCvColor(int32_t b, int32_t g, int32_t r)
 {
@@ -55,11 +59,21 @@ void CommonHelper::DrawText(cv::Mat& mat, const std::string& text, cv::Point pos
     }
 }
 
-void CommonHelper::CropResizeCvt(const cv::Mat& org, cv::Mat& dst, int32_t& crop_x, int32_t& crop_y, int32_t& crop_w, int32_t& crop_h, bool is_rgb, int32_t crop_type, bool resize_by_linear)
+void CommonHelper::CropResizeCvt(const cv::Mat& org, cv::Mat& dst, int32_t& crop_x, int32_t& crop_y, int32_t& crop_w, int32_t& crop_h, bool is_rgb, int32_t crop_type, bool resize_by_linear, int32_t target_width, int32_t target_height)
 {
     const int32_t interpolation_flag = resize_by_linear ? cv::INTER_LINEAR : cv::INTER_NEAREST;
 
     cv::Mat src = org(cv::Rect(crop_x, crop_y, crop_w, crop_h));
+    PRINT("CropResizeCvt: src width=%d, height=%d, channels=%d, target_width=%d, target_height=%d\n", 
+          src.cols, src.rows, src.channels(), target_width, target_height);
+
+    // Initialize dst with target dimensions (width=target_width, height=target_height for OpenCV)
+    if (target_width > 0 && target_height > 0) {
+        dst = cv::Mat(cv::Size(target_width, target_height), src.type()); // OpenCV: cols=width, rows=height
+    } else if (dst.empty()) {
+        dst = cv::Mat(cv::Size(src.cols, src.rows), src.type());
+    }
+    PRINT("CropResizeCvt: dst initialized width=%d, height=%d, type=%d\n", dst.cols, dst.rows, dst.type());
 
     if (crop_type == kCropTypeStretch) {
         cv::resize(src, dst, dst.size(), 0, 0, interpolation_flag);
@@ -99,25 +113,40 @@ void CommonHelper::CropResizeCvt(const cv::Mat& org, cv::Mat& dst, int32_t& crop
         crop_h = dst.rows * crop_h / target_rect.height;
     }
 
+    PRINT("CropResizeCvt: after resize dst width=%d, height=%d, channels=%d, data=%p\n", 
+          dst.cols, dst.rows, dst.channels(), dst.data);
+
+    if (!dst.data || dst.empty()) {
+        PRINT_E("CropResizeCvt: dst is invalid after resize\n");
+        return;
+    }
+
 #ifdef CV_COLOR_IS_RGB
     if (!is_rgb) {
         cv::cvtColor(dst, dst, cv::COLOR_RGB2BGR);
+        PRINT("CropResizeCvt: Converted RGB to BGR\n");
     }
 #else
     if (is_rgb) {
         cv::cvtColor(dst, dst, cv::COLOR_BGR2RGB);
+        PRINT("CropResizeCvt: Converted BGR to RGB\n");
     }
 #endif
-
 }
 
-/* https://github.com/JetsonHacksNano/CSI-Camera/blob/master/simple_camera.cpp */
-/* modified by iwatake2222 */
-std::string CommonHelper::CreateGStreamerPipeline(int capture_width, int capture_height, int display_width, int display_height, int framerate, int flip_method) {
+std::string CommonHelper::CreateGStreamerPipeline(int capture_width, int capture_height, int display_width, int display_height, int framerate, int flip_method)
+{
     return "nvarguscamerasrc ! video/x-raw(memory:NVMM), width=(int)" + std::to_string(capture_width) + ", height=(int)" +
-        std::to_string(capture_height) + ", format=(string)NV12, framerate=(fraction)" + std::to_string(framerate) +
-        "/1 ! nvvidconv flip-method=" + std::to_string(flip_method) + " ! video/x-raw, width=(int)" + std::to_string(display_width) + ", height=(int)" +
-        std::to_string(display_height) + ", format=(string)BGRx ! videoconvert ! video/x-raw, format=(string)BGR ! appsink max-buffers=1 drop=True";
+           std::to_string(capture_height) + ", format=(string)NV12, framerate=(fraction)" + std::to_string(framerate) +
+           "/1 ! nvvidconv flip-method=" + std::to_string(flip_method) + " ! video/x-raw, width=(int)" + std::to_string(display_width) + ", height=(int)" +
+           std::to_string(display_height) + ", format=(string)BGRx ! videoconvert ! video/x-raw, format=(string)BGR ! appsink max-buffers=1 drop=True";
+}
+
+void CommonHelper::SaveImage(const cv::Mat& mat, const std::string& filename)
+{
+    if (!mat.empty()) {
+        cv::imwrite(filename, mat);
+    }
 }
 
 bool CommonHelper::FindSourceImage(const std::string& input_name, cv::VideoCapture& cap, int32_t width, int32_t height)
@@ -128,11 +157,15 @@ bool CommonHelper::FindSourceImage(const std::string& input_name, cv::VideoCaptu
             printf("Invalid input source: %s\n", input_name.c_str());
             return false;
         }
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1); // Ensure minimal buffering
     } else if (input_name.find(".jpg") != std::string::npos || input_name.find(".png") != std::string::npos || input_name.find(".bmp") != std::string::npos) {
-        if (cv::imread(input_name).empty()) {
+        cv::Mat image = cv::imread(input_name);
+        if (image.empty()) {
             printf("Invalid input source: %s\n", input_name.c_str());
             return false;
         }
+        CommonHelper::SaveImage(image, "output/input_" + input_name);
+        image.release();
     } else {
         if (input_name == "jetson") {
             cap = cv::VideoCapture(CreateGStreamerPipeline(width, height, width, height, 60, 2));
@@ -140,8 +173,7 @@ bool CommonHelper::FindSourceImage(const std::string& input_name, cv::VideoCaptu
             int32_t cam_id = -1;
             try {
                 cam_id = std::stoi(input_name);
-            }
-            catch (...) {}
+            } catch (...) {}
             cap = (cam_id >= 0) ? cv::VideoCapture(cam_id) : cv::VideoCapture(input_name);
             cap.set(cv::CAP_PROP_FRAME_WIDTH, width);
             cap.set(cv::CAP_PROP_FRAME_HEIGHT, height);

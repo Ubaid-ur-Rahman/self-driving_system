@@ -29,7 +29,6 @@ limitations under the License.
 #include "bounding_box.h"
 #include "kalman_filter.h"
 
-
 class Track {
 private:
     static constexpr int32_t kMaxHistoryNum = 30;
@@ -58,7 +57,7 @@ public:
     void UpdateNoDetect();
 
     std::deque<Data>& GetDataHistory();
-    Data& GetLatestData() ;
+    const Data &GetLatestData() const; // Correct declaration
     BoundingBox& GetLatestBoundingBox();
 
     const int32_t GetId() const;
@@ -79,7 +78,6 @@ private:
     int32_t cnt_undetected_;
 };
 
-
 class Tracker {
 private:
     static constexpr float kCostMax = 1.0F;
@@ -90,7 +88,6 @@ public:
     void Reset();
 
     void Update(const std::vector<BoundingBox>& det_list);
-
     std::vector<Track>& GetTrackList();
 
 private:
@@ -99,7 +96,6 @@ private:
 private:
     std::vector<Track> track_list_;
     int32_t track_sequence_num_;
-
     int32_t threshold_frame_to_delete_;
 };
 

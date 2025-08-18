@@ -1,19 +1,3 @@
-/* Copyright 2021 iwatake2222
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
-/*** Include ***/
-/* for general */
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
@@ -74,42 +58,61 @@ int32_t ObjectDetection::Process(const cv::Mat& mat, const cv::Mat& mat_transfor
     /* Track */
     tracker_.Update(det_result.bbox_list);
     auto& track_list = tracker_.GetTrackList();
+    PRINT("Frame: track_list size=%zu\n", track_list.size()); // Added for memory debugging
+
+    /* Store bounding boxes for GetBoundingBoxes */
+    bboxes_.clear();
+    for (const auto& track : track_list) {
+        if (track.GetUndetectedCount() > 0) continue; // Skip undetected tracks
+        bboxes_.push_back(track.GetLatestData().bbox);
+    }
+    PRINT("Frame: bboxes_ size=%zu\n", bboxes_.size()); // For memory debugging
 
     /* Convert points from normal view -> top view. Store the results into track data */
     std::vector<cv::Point2f> normal_points;
     std::vector<cv::Point2f> topview_points;
-    for (auto& track : track_list) {
+    for (const auto& track : track_list) {
         const auto& bbox = track.GetLatestData().bbox;
         normal_points.push_back({ bbox.x + bbox.w / 2.0f, bbox.y + bbox.h + 0.0f });
     }
     if (normal_points.size() > 0) {
         cv::perspectiveTransform(normal_points, topview_points, mat_transform);
         for (int32_t i = 0; i < static_cast<int32_t>(track_list.size()); i++) {
-            auto& track_data = track_list[i].GetLatestData();
+            auto& track_data = track_list[i].GetDataHistory().back(); // Use non-const reference
             track_data.topview_point.x = static_cast<int32_t>(topview_points[i].x);
             track_data.topview_point.y = static_cast<int32_t>(topview_points[i].y);
         }
     }
 
-    /* Calcualte points in world coordinate (distance on ground plane) */
+    /* Calculate points in world coordinate (distance on ground plane) */
     std::vector<cv::Point2f> image_point_list;
     std::vector<cv::Point3f> object_point_list;
-    for (auto& track : track_list) {
+    for (const auto& track : track_list) {
         const auto& bbox = track.GetLatestData().bbox;
         image_point_list.push_back(cv::Point2f(bbox.x + bbox.w / 2.0f, bbox.y + bbox.h + 0.0f));
     }
     camera.ConvertImage2GroundPlane(image_point_list, object_point_list);
 
-    int32_t index = 0;
-    for (auto& track : track_list) {
-        auto& object_point_track = track.GetLatestData().object_point;
-        object_point_track.x = object_point_list[index].x;
-        object_point_track.y = object_point_list[index].y;
-        object_point_track.z = object_point_list[index].z;
-        index++;
+    for (int32_t i = 0; i < static_cast<int32_t>(track_list.size()); i++) {
+        auto& track_data = track_list[i].GetDataHistory().back(); // Use non-const reference
+        track_data.object_point.x = object_point_list[i].x;
+        track_data.object_point.y = object_point_list[i].y;
+        track_data.object_point.z = object_point_list[i].z;
     }
 
+    // Release temporary vectors
+    normal_points.clear();
+    topview_points.clear();
+    image_point_list.clear();
+    object_point_list.clear();
+    det_result.bbox_list.clear(); // Clear detection results to free memory
+
     return kRetOk;
+}
+
+const std::vector<BoundingBox>& ObjectDetection::GetBoundingBoxes() const
+{
+    return bboxes_;
 }
 
 void ObjectDetection::Draw(cv::Mat& mat, cv::Mat& mat_topview)

@@ -44,28 +44,23 @@ float BoundingBoxUtils::CalculateIoU(const BoundingBox& obj0, const BoundingBox&
 
 void BoundingBoxUtils::Nms(std::vector<BoundingBox>& bbox_list, std::vector<BoundingBox>& bbox_nms_list, float threshold_nms_iou, bool check_class_id)
 {
-    std::sort(bbox_list.begin(), bbox_list.end(), [](BoundingBox const& lhs, BoundingBox const& rhs) {
-        //if (lhs.w * lhs.h > rhs.w * rhs.h) return true;
-        if (lhs.score > rhs.score) return true;
-        return false;
-        });
+    std::sort(bbox_list.begin(), bbox_list.end(), [](const BoundingBox& lhs, const BoundingBox& rhs) {
+        return lhs.score > rhs.score;
+    });
 
     std::unique_ptr<bool[]> is_merged(new bool[bbox_list.size()]);
     for (size_t i = 0; i < bbox_list.size(); i++) is_merged[i] = false;
+
     for (size_t index_high_score = 0; index_high_score < bbox_list.size(); index_high_score++) {
-        std::vector<BoundingBox> candidates;
         if (is_merged[index_high_score]) continue;
-        candidates.push_back(bbox_list[index_high_score]);
+        bbox_nms_list.push_back(std::move(bbox_list[index_high_score]));
         for (size_t index_low_score = index_high_score + 1; index_low_score < bbox_list.size(); index_low_score++) {
             if (is_merged[index_low_score]) continue;
             if (check_class_id && bbox_list[index_high_score].class_id != bbox_list[index_low_score].class_id) continue;
             if (CalculateIoU(bbox_list[index_high_score], bbox_list[index_low_score]) > threshold_nms_iou) {
-                candidates.push_back(bbox_list[index_low_score]);
                 is_merged[index_low_score] = true;
             }
         }
-
-        bbox_nms_list.push_back(candidates[0]);
     }
 }
 
@@ -74,5 +69,5 @@ void BoundingBoxUtils::FixInScreen(BoundingBox& bbox, int32_t width, int32_t hei
     bbox.x = (std::max)(0, bbox.x);
     bbox.y = (std::max)(0, bbox.y);
     bbox.w = (std::min)(width - bbox.x, bbox.w);
-    bbox.h = (std::min)(width - bbox.y, bbox.h);
+    bbox.h = (std::min)(height - bbox.y, bbox.h); 
 }

@@ -236,7 +236,7 @@ public:
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int32_t i = 0; i < object_point_list.size(); i++) {
+        for (size_t i = 0; i < object_point_list.size(); i++) {
             const auto& object_point = object_point_list[i];
             auto& image_point = image_point_list[i];
             cv::Mat Mw = (cv::Mat_<float>(4, 1) << object_point.x, object_point.y, object_point.z, 1);
@@ -295,7 +295,7 @@ public:
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int32_t i = 0; i < object_point_in_world_list.size(); i++) {
+        for (size_t i = 0; i < object_point_in_world_list.size(); i++) {
             const auto& object_point_in_world = object_point_in_world_list[i];
             auto& object_point_in_camera = object_point_in_camera_list[i];
             cv::Mat Mw = (cv::Mat_<float>(4, 1) << object_point_in_world.x, object_point_in_world.y, object_point_in_world.z, 1);
@@ -324,7 +324,7 @@ public:
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int32_t i = 0; i < object_point_in_camera_list.size(); i++) {
+        for (size_t i = 0; i < object_point_in_camera_list.size(); i++) {
             const auto& object_point_in_camera = object_point_in_camera_list[i];
             auto& object_point_in_world = object_point_in_world_list[i];
             cv::Mat Mc = (cv::Mat_<float>(3, 1) << object_point_in_camera.x, object_point_in_camera.y, object_point_in_camera.z);
@@ -369,8 +369,8 @@ public:
         }
 
         object_point_list.resize(image_point_list.size());
-        for (int32_t i = 0; i < object_point_list.size(); i++) {
-            const auto& image_point = image_point_list[i];
+        for (size_t i = 0; i < object_point_list.size(); i++) {
+            //const auto& image_point = image_point_list[i];
             auto& object_point = object_point_list[i];
 
             float x = image_point_undistort[i].x;
@@ -404,7 +404,7 @@ public:
         /*** Image -> Mc ***/
         if (image_point_list.size() == 0) {
             /* Convert for all pixels on image, when image_point_list = empty */
-            if (z_list.size() != this->width * this->height) {
+            if (z_list.size() != static_cast<size_t>(this->width) * this->height) {
                 printf("[ConvertImage2Camera] Invalid z_list size\n");
                 return;
             }
@@ -435,7 +435,7 @@ public:
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int32_t i = 0; i < object_point_list.size(); i++) {
+        for (size_t i = 0; i < object_point_list.size(); i++) {
             const auto& Zc = z_list[i];
             auto& object_point = object_point_list[i];
 

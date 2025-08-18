@@ -1,19 +1,3 @@
-/* Copyright 2021 iwatake2222
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
-/*** Include ***/
-/* for general */
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
@@ -35,12 +19,10 @@ limitations under the License.
 #include "curve_fitting.h"
 #include "lane_detection.h"
 
-
 /*** Macro ***/
 #define TAG "LaneDetection"
 #define PRINT(...)   COMMON_HELPER_PRINT(TAG, __VA_ARGS__)
 #define PRINT_E(...) COMMON_HELPER_PRINT_E(TAG, __VA_ARGS__)
-
 
 /*** Function ***/
 int32_t LaneDetection::Initialize(const std::string& work_dir, const int32_t num_threads)
@@ -49,6 +31,12 @@ int32_t LaneDetection::Initialize(const std::string& work_dir, const int32_t num
         lane_engine_.Finalize();
         return kRetErr;
     }
+    normal_line_list_.clear();
+    topview_line_list_.clear();
+    ground_line_list_.clear();
+    line_coeff_list_.clear();
+    line_valid_list_.clear();
+    line_det_cnt_list_.clear();
     return kRetOk;
 }
 
@@ -57,7 +45,18 @@ int32_t LaneDetection::Finalize()
     if (lane_engine_.Finalize() != LaneEngine::kRetOk) {
         return kRetErr;
     }
+    normal_line_list_.clear();
+    topview_line_list_.clear();
+    ground_line_list_.clear();
+    line_coeff_list_.clear();
+    line_valid_list_.clear();
+    line_det_cnt_list_.clear();
     return kRetOk;
+}
+
+const std::vector<std::vector<cv::Point2f>>& LaneDetection::GetLanePoints() const
+{
+    return normal_line_list_;
 }
 
 int32_t LaneDetection::Process(const cv::Mat& mat, const cv::Mat& mat_transform, CameraModel& camera)
@@ -75,17 +74,26 @@ int32_t LaneDetection::Process(const cv::Mat& mat, const cv::Mat& mat_transform,
     normal_line_list_.clear();
     for (const auto& line : lane_result.line_list) {
         std::vector<cv::Point2f> normal_line;
+        normal_line.reserve(line.size()); // Pre-allocate
         for (const auto& p : line) {
             normal_line.push_back({ static_cast<float>(p.first), static_cast<float>(p.second) });
         }
         normal_line_list_.push_back(normal_line);
     }
+    PRINT("Frame: normal_line_list_ size=%zu, points per lane=[%zu,%zu,%zu,%zu]\n",
+          normal_line_list_.size(),
+          normal_line_list_.size() > 0 ? normal_line_list_[0].size() : 0,
+          normal_line_list_.size() > 1 ? normal_line_list_[1].size() : 0,
+          normal_line_list_.size() > 2 ? normal_line_list_[2].size() : 0,
+          normal_line_list_.size() > 3 ? normal_line_list_[3].size() : 0);
 
     /* Convert to topview */
     topview_line_list_.clear();
+    topview_line_list_.reserve(normal_line_list_.size()); // Pre-allocate
     for (const auto& line : normal_line_list_) {
         std::vector<cv::Point2f> topview_line;
-        if (line.size() > 0) {
+        if (!line.empty()) {
+            topview_line.reserve(line.size()); // Pre-allocate
             cv::perspectiveTransform(line, topview_line, mat_transform);
         }
         topview_line_list_.push_back(topview_line);
@@ -93,44 +101,45 @@ int32_t LaneDetection::Process(const cv::Mat& mat, const cv::Mat& mat_transform,
 
     /* Convert to ground plane */
     ground_line_list_.clear();
+    ground_line_list_.reserve(normal_line_list_.size()); // Pre-allocate
     for (const auto& line : normal_line_list_) {
         std::vector<cv::Point2f> ground_line;
         std::vector<cv::Point3f> ground_line_xyz;
-        camera.ConvertImage2GroundPlane(line, ground_line_xyz);
-        for (const auto& p : ground_line_xyz) {
-            ground_line.push_back({ p.z, p.x });
+        if (!line.empty()) {
+            ground_line_xyz.reserve(line.size()); // Pre-allocate
+            ground_line.reserve(line.size()); // Pre-allocate
+            camera.ConvertImage2GroundPlane(line, ground_line_xyz);
+            for (const auto& p : ground_line_xyz) {
+                ground_line.push_back({ p.z, p.x });
+            }
         }
         ground_line_list_.push_back(ground_line);
+        ground_line_xyz.clear(); // Explicit clear
     }
 
     /* Curve Fitting (y = ax^2 + bx + c, where y = depth, x = horizontal) */
     current_line_valid_list_.clear();
+    current_line_valid_list_.reserve(ground_line_list_.size()); // Pre-allocate
     std::vector<LineCoeff> current_line_coeff_list;
-    for (auto line : ground_line_list_) {
+    current_line_coeff_list.reserve(ground_line_list_.size()); // Pre-allocate
+    for (auto& line : ground_line_list_) {
         double a = 0, b = 0, c = 0;
         double error = 999;
         if (line.size() > 4 && std::abs(line[0].x - line[line.size() - 1].x) > 5) {
-            /* At first, try to use quadratic regression if I have enough points and the points have enough length (more than 5m) */
             (void)CurveFitting::SolveQuadraticRegression(line, a, b, c);
             error = CurveFitting::ErrorMaxQuadraticRegression(line, a, b, c);
         }
         if (error > 0.1 && line.size() > 2) {
-            /* Use linear regression, if I didn't use quadratic regression or the result of quadratic regression is not good (the maximum error > 0.1m) */
             (void)CurveFitting::SolveLinearRegression(line, b, c);
             error = CurveFitting::ErrorMaxLinearRegression(line, b, c);
             if (error > 0.1) {
-                /* Regression failes is error is huge */
                 a = 0;
                 b = 0;
                 c = 0;
             }
         }
         current_line_coeff_list.push_back({ a, b, c });
-        if (a == 0 && b == 0 && c == 0) {
-            current_line_valid_list_.push_back(false);
-        } else {
-            current_line_valid_list_.push_back(true);
-        }
+        current_line_valid_list_.push_back(a != 0 || b != 0 || c != 0);
     }
 
     if (line_coeff_list_.empty()) {
@@ -144,9 +153,9 @@ int32_t LaneDetection::Process(const cv::Mat& mat, const cv::Mat& mat_transform,
         if (current_line_valid_list_[line_index]) {
             float kMixRatio = 0.05f;
             if (!line_valid_list_[line_index]) {
-                kMixRatio = 1.0f;   /* detect the line for the first time */
+                kMixRatio = 1.0f;
             } else if (line_det_cnt_list_[line_index] < 10) {
-                kMixRatio = 0.2f;   /* the first few frames after the line is detected for the first time */
+                kMixRatio = 0.2f;
             }
             auto& line_coeff = line_coeff_list_[line_index];
             line_coeff.a = current_line_coeff_list[line_index].a * kMixRatio + line_coeff.a * (1.0 - kMixRatio);
@@ -176,13 +185,13 @@ int32_t LaneDetection::Process(const cv::Mat& mat, const cv::Mat& mat_transform,
         }
     }
 
+    lane_result.line_list.clear(); // Explicit clear
     return kRetOk;
 }
 
 void LaneDetection::Draw(cv::Mat& mat, cv::Mat& mat_topview, CameraModel& camera)
 {
     /*** Draw on NormalView ***/
-    /* draw points */
     for (int32_t line_index = 0; line_index < static_cast<int32_t>(normal_line_list_.size()); line_index++) {
         const auto& line = normal_line_list_[line_index];
         for (const auto& p : line) {
@@ -191,7 +200,6 @@ void LaneDetection::Draw(cv::Mat& mat, cv::Mat& mat_topview, CameraModel& camera
     }
 
     /*** Draw on TopView ***/
-    /* draw points */
     for (int32_t line_index = 0; line_index < static_cast<int32_t>(topview_line_list_.size()); line_index++) {
         const auto& line = topview_line_list_[line_index];
         for (const auto& p : line) {
@@ -199,7 +207,6 @@ void LaneDetection::Draw(cv::Mat& mat, cv::Mat& mat_topview, CameraModel& camera
         }
     }
 
-    /* draw line */
     static constexpr float kLineIntervalMeter = 1.0f;
     static constexpr float kLineFarthestPointMeter[4] = { 10.0f, 15.0f, 15.0f, 10.0f };
     for (int32_t line_index = 0; line_index < static_cast<int32_t>(line_coeff_list_.size()); line_index++) {

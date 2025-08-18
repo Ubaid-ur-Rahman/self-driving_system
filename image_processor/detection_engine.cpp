@@ -1,19 +1,3 @@
-/* Copyright 2021 iwatake2222
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
-/*** Include ***/
-/* for general */
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
@@ -48,7 +32,7 @@ limitations under the License.
 
 #if defined(MODEL_TYPE_TFLITE)
 #define MODEL_NAME  "yolox_nano_480x640.tflite"
-#define TENSORTYPE  TensorInfo::kTensorTypeFp32
+#define TENSORTYPE  InferenceHelper::kTensorTypeFloat32
 #define INPUT_NAME  "images"
 #define INPUT_DIMS  { 1, 480, 640, 3 }
 #define IS_NCHW     false
@@ -56,7 +40,7 @@ limitations under the License.
 #define OUTPUT_NAME "Identity"
 #elif defined(MODEL_TYPE_ONNX)
 #define MODEL_NAME  "yolox_nano_480x640.onnx"
-#define TENSORTYPE  TensorInfo::kTensorTypeFp32
+#define TENSORTYPE  InferenceHelper::kTensorTypeFloat32
 #define INPUT_NAME  "images"
 #define INPUT_DIMS  { 1, 3, 480, 640 }
 #define IS_NCHW     true
@@ -71,43 +55,39 @@ static constexpr int32_t kElementNumOfAnchor = kNumberOfClass + 5;    // x, y, w
 
 #define LABEL_NAME   "label_coco_80.txt"
 
-
 /*** Function ***/
 int32_t DetectionEngine::Initialize(const std::string& work_dir, const int32_t num_threads)
 {
     /* Set model information */
-    std::string model_filename = work_dir + "/model/" + MODEL_NAME;
-    std::string labelFilename = work_dir + "/model/" + LABEL_NAME;
+    std::string model_filename = work_dir + "pre_trained/" + MODEL_NAME;
+    std::string labelFilename = work_dir + "model_parameters/" + LABEL_NAME;
 
     /* Set input tensor info */
     input_tensor_info_list_.clear();
-    InputTensorInfo input_tensor_info(INPUT_NAME, TENSORTYPE, IS_NCHW);
+    InferenceHelper::InputTensorInfo input_tensor_info(INPUT_NAME, TENSORTYPE, IS_NCHW);
     input_tensor_info.tensor_dims = INPUT_DIMS;
-    input_tensor_info.data_type = InputTensorInfo::kDataTypeImage;
-    input_tensor_info.normalize.mean[0] = 0.485f;
-    input_tensor_info.normalize.mean[1] = 0.456f;
-    input_tensor_info.normalize.mean[2] = 0.406f;
-    input_tensor_info.normalize.norm[0] = 0.229f;
-    input_tensor_info.normalize.norm[1] = 0.224f;
-    input_tensor_info.normalize.norm[2] = 0.225f;
+    input_tensor_info.data_type = InferenceHelper::InputTensorInfo::kDataTypeImage;
+    input_tensor_info.normalize_mean[0] = 0.485f;
+    input_tensor_info.normalize_mean[1] = 0.456f;
+    input_tensor_info.normalize_mean[2] = 0.406f;
+    input_tensor_info.normalize_norm[0] = 0.229f;
+    input_tensor_info.normalize_norm[1] = 0.224f;
+    input_tensor_info.normalize_norm[2] = 0.225f;
     input_tensor_info_list_.push_back(input_tensor_info);
 
     /* Set output tensor info */
     output_tensor_info_list_.clear();
-    output_tensor_info_list_.push_back(OutputTensorInfo(OUTPUT_NAME, TENSORTYPE));
+    output_tensor_info_list_.push_back(InferenceHelper::OutputTensorInfo(OUTPUT_NAME, TENSORTYPE));
 
     /* Create and Initialize Inference Helper */
 #if defined(MODEL_TYPE_TFLITE)
-    //inference_helper_.reset(InferenceHelper::Create(InferenceHelper::kTensorflowLite));
-    inference_helper_.reset(InferenceHelper::Create(InferenceHelper::kTensorflowLiteXnnpack));
-    //inference_helper_.reset(InferenceHelper::Create(InferenceHelper::kTensorflowLiteGpu));
-    //inference_helper_.reset(InferenceHelper::Create(InferenceHelper::kTensorflowLiteEdgetpu));
-    //inference_helper_.reset(InferenceHelper::Create(InferenceHelper::kTensorflowLiteNnapi));
+    inference_helper_ = std::unique_ptr<InferenceHelper>(InferenceHelper::Create(InferenceHelper::kTensorflowLiteXnnpack));
 #elif defined(MODEL_TYPE_ONNX)
-    inference_helper_.reset(InferenceHelper::Create(InferenceHelper::kTensorrt));
+    inference_helper_ = std::unique_ptr<InferenceHelper>(InferenceHelper::Create(InferenceHelper::kTensorrt));
 #endif
 
     if (!inference_helper_) {
+        PRINT_E("Failed to create inference helper\n");
         return kRetErr;
     }
     if (inference_helper_->SetNumThreads(num_threads) != InferenceHelper::kRetOk) {
@@ -137,8 +117,7 @@ int32_t DetectionEngine::Finalize()
     return kRetOk;
 }
 
-
-void DetectionEngine::GetBoundingBox(const float* data, float scale_x, float  scale_y, int32_t grid_w, int32_t grid_h, std::vector<BoundingBox>& bbox_list)
+void DetectionEngine::GetBoundingBox(const float* data, float scale_x, float scale_y, int32_t grid_w, int32_t grid_h, std::vector<BoundingBox>& bbox_list)
 {
     int32_t index = 0;
     for (int32_t grid_y = 0; grid_y < grid_h; grid_y++) {
@@ -172,7 +151,6 @@ void DetectionEngine::GetBoundingBox(const float* data, float scale_x, float  sc
     }
 }
 
-
 int32_t DetectionEngine::Process(const cv::Mat& original_mat, Result& result)
 {
     if (!inference_helper_) {
@@ -181,19 +159,17 @@ int32_t DetectionEngine::Process(const cv::Mat& original_mat, Result& result)
     }
     /*** PreProcess ***/
     const auto& t_pre_process0 = std::chrono::steady_clock::now();
-    InputTensorInfo& input_tensor_info = input_tensor_info_list_[0];
+    InferenceHelper::InputTensorInfo& input_tensor_info = input_tensor_info_list_[0];
     /* do crop, resize and color conversion here because some inference engine doesn't support these operations */
     int32_t crop_x = 0;
     int32_t crop_y = 0;
     int32_t crop_w = original_mat.cols;
     int32_t crop_h = original_mat.rows;
     cv::Mat img_src = cv::Mat::zeros(input_tensor_info.GetHeight(), input_tensor_info.GetWidth(), CV_8UC3);
-    //CommonHelper::CropResizeCvt(original_mat, img_src, crop_x, crop_y, crop_w, crop_h, IS_RGB, CommonHelper::kCropTypeStretch);
-    //CommonHelper::CropResizeCvt(original_mat, img_src, crop_x, crop_y, crop_w, crop_h, IS_RGB, CommonHelper::kCropTypeCut);
     CommonHelper::CropResizeCvt(original_mat, img_src, crop_x, crop_y, crop_w, crop_h, IS_RGB, CommonHelper::kCropTypeExpand);
 
     input_tensor_info.data = img_src.data;
-    input_tensor_info.data_type = InputTensorInfo::kDataTypeImage;
+    input_tensor_info.data_type = InferenceHelper::InputTensorInfo::kDataTypeImage;
     input_tensor_info.image_info.width = img_src.cols;
     input_tensor_info.image_info.height = img_src.rows;
     input_tensor_info.image_info.channel = img_src.channels();
@@ -217,7 +193,7 @@ int32_t DetectionEngine::Process(const cv::Mat& original_mat, Result& result)
 
     /*** PostProcess ***/
     const auto& t_post_process0 = std::chrono::steady_clock::now();
-    /* Get boundig box */
+    /* Get bounding box */
     std::vector<BoundingBox> bbox_list;
     float* output_data = output_tensor_info_list_[0].GetDataAsFloat();
     for (const auto& grid_scale : kGridScaleList) {
@@ -228,7 +204,6 @@ int32_t DetectionEngine::Process(const cv::Mat& original_mat, Result& result)
         GetBoundingBox(output_data, scale_x, scale_y, grid_w, grid_h, bbox_list);
         output_data += grid_w * grid_h * kGridChannel * kElementNumOfAnchor;
     }
-
 
     /* Adjust bounding box */
     for (auto& bbox : bbox_list) {
@@ -251,11 +226,10 @@ int32_t DetectionEngine::Process(const cv::Mat& original_mat, Result& result)
     result.crop.h = (std::min)(crop_h, original_mat.rows - result.crop.y);
     result.time_pre_process = static_cast<std::chrono::duration<double>>(t_pre_process1 - t_pre_process0).count() * 1000.0;
     result.time_inference = static_cast<std::chrono::duration<double>>(t_inference1 - t_inference0).count() * 1000.0;
-    result.time_post_process = static_cast<std::chrono::duration<double>>(t_post_process1 - t_post_process0).count() * 1000.0;;
+    result.time_post_process = static_cast<std::chrono::duration<double>>(t_post_process1 - t_post_process0).count() * 1000.0;
 
     return kRetOk;
 }
-
 
 int32_t DetectionEngine::ReadLabel(const std::string& filename, std::vector<std::string>& label_list)
 {
@@ -271,4 +245,3 @@ int32_t DetectionEngine::ReadLabel(const std::string& filename, std::vector<std:
     }
     return kRetOk;
 }
-

@@ -2,16 +2,7 @@
 #define _ENHANCED_WINDOW_H_
 
 /*
-This class enhances the window component of cvui by making it movable and minimizable.
 
-Authors:
-	ShengYu - https://github.com/shengyu7697
-	Amaury Bréhéret - https://github.com/abreheret
-
-Contributions:
-	Fernando Bevilacqua <dovyski@gmail.com>
-
-Code licensed under the MIT license.
 */
 class EnhancedWindow
 {

@@ -102,7 +102,7 @@ std::deque<Track::Data>& Track::GetDataHistory()
     return data_history_;
 }
 
-Track::Data& Track::GetLatestData()
+const Track::Data& Track::GetLatestData() const
 {
     return data_history_.back();
 }
